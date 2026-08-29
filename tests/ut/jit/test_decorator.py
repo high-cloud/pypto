@@ -14,6 +14,7 @@ import importlib
 import inspect
 import re
 import warnings
+from typing import Any
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -63,6 +64,190 @@ class TestJitDecoration:
             return a
 
         assert my_kernel.__name__ == "my_kernel"
+
+    def test_constexpr_requires_complete_specialization(self):
+        tile: Any = pl.constexpr("TILE")
+        scale: Any = pl.constexpr("SCALE")
+
+        @jit
+        def my_kernel(a: pl.Tensor[[tile, tile], pl.FP32]):
+            return pl.mul(a, scale)
+
+        with pytest.raises(TypeError, match="missing.*SCALE"):
+            my_kernel.specialize(TILE=32)
+        with pytest.raises(TypeError, match="unknown.*EXTRA"):
+            my_kernel.specialize(TILE=32, SCALE=0.5, EXTRA=True)
+
+        specialized = my_kernel.specialize(TILE=32, SCALE=0.5)
+        assert specialized._constexpr_values == {"TILE": 32, "SCALE": 0.5}
+        assert specialized._param_names() == ["a"]
+
+    def test_constexpr_specializes_signature_and_body(self):
+        tile: Any = pl.constexpr("TILE")
+        scale: Any = pl.constexpr("SCALE")
+
+        @jit
+        def scale_kernel(
+            a: pl.Tensor[[tile, tile], pl.FP32],
+            out: pl.Out[pl.Tensor[[tile, tile], pl.FP32]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [tile, tile])
+                scaled = pl.mul(value, scale)
+                pl.store(scaled, [0, 0], out)
+            return out
+
+        scale_kernel = scale_kernel.specialize(TILE=32, SCALE=0.5)
+        program = scale_kernel.lower()
+        rendered = str(program)
+        assert "constexpr" not in rendered
+        assert "TILE" not in rendered
+        assert "SCALE" not in rendered
+
+    def test_constexpr_inline_dependency(self):
+        tile: Any = pl.constexpr("TILE")
+
+        @jit.inline
+        def copy_inline(
+            a: pl.Tensor[[tile, tile], pl.FP32],
+            out: pl.Out[pl.Tensor[[tile, tile], pl.FP32]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [tile, tile])
+                pl.store(value, [0, 0], out)
+            return out
+
+        copy_inline = copy_inline.specialize(TILE=32)
+
+        @jit
+        def entry(
+            a: pl.Tensor[[32, 32], pl.FP32],
+            out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+        ):
+            out = copy_inline(a, out)
+            return out
+
+        program = entry.lower()
+        assert "copy_inline" not in [func.name for func in program.functions.values()]
+
+    def test_multiple_constexpr_specializations_in_one_program(self):
+        tile: Any = pl.constexpr("TILE")
+
+        @jit.inline
+        def copy_template(
+            a: pl.Tensor[[tile, tile], pl.FP32],
+            out: pl.Tensor[[tile, tile], pl.FP32],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [tile, tile])
+                pl.store(value, [0, 0], out)
+            return out
+
+        copy_32 = copy_template.specialize(TILE=32)
+        copy_64 = copy_template.specialize(TILE=64)
+
+        @jit
+        def entry(
+            a32: pl.Tensor[[32, 32], pl.FP32],
+            out32: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            a64: pl.Tensor[[64, 64], pl.FP32],
+            out64: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ):
+            out32 = copy_32(a32, out32)
+            out64 = copy_64(a64, out64)
+            return out32, out64
+
+        deps = entry._get_deps()
+        assert len(deps) == 2
+        assert len({dep.__name__ for dep in deps}) == 2
+        assert all(dep.__name__.startswith("copy_template__constexpr_") for dep in deps)
+
+        program = entry.lower()
+        func_names = [func.name for func in program.functions.values()]
+        assert not any(name.startswith("copy_template__constexpr_") for name in func_names)
+        assert "entry" in func_names
+
+    def test_call_site_constexpr_specializations_in_one_program(self):
+        @jit.inline
+        def copy_template(
+            a: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Tensor[[64, 64], pl.FP32],
+            *,
+            TILE: pl.constexpr,
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [TILE, TILE])
+                pl.store(value, [0, 0], out)
+            return out
+
+        @jit
+        def entry(
+            a: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+        ):
+            copy_template(a, out, TILE=32)
+            copy_template(a, out, TILE=64)
+            return out
+
+        deps = entry._get_deps()
+        assert len(deps) == 2
+        assert {dep._constexpr_values["TILE"] for dep in deps} == {32, 64}
+        assert len({dep.__name__ for dep in deps}) == 2
+
+        program = entry.lower()
+        func_names = [func.name for func in program.functions.values()]
+        assert not any(name.startswith("copy_template__constexpr_") for name in func_names)
+        assert "entry" in func_names
+
+    def test_entry_constexpr_binds_from_compile_keyword(self):
+        @jit
+        def entry(
+            a: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            *,
+            TILE: pl.constexpr,
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [TILE, TILE])
+                pl.store(value, [0, 0], out)
+            return out
+
+        with pytest.raises(TypeError, match="unbound constexpr values"):
+            entry.lower()
+
+        first, first_kwargs = entry._bind_call_constexprs({"TILE": 32})
+        second, second_kwargs = entry._bind_call_constexprs({"TILE": 32})
+        assert first is second
+        assert first_kwargs == second_kwargs == {}
+
+        program = entry.lower(TILE=32)
+        assert "entry" in [func.name for func in program.functions.values()]
+
+    def test_entry_constexpr_flows_to_inline_dependency(self):
+        @jit.inline
+        def copy_template(
+            a: pl.Tensor,
+            out: pl.Tensor,
+            *,
+            TILE: pl.constexpr,
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                value = pl.load(a, [0, 0], [TILE, TILE])
+                pl.store(value, [0, 0], out)
+            return out
+
+        @jit
+        def entry(
+            a: pl.Tensor[[64, 64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            *,
+            TILE: pl.constexpr,
+        ):
+            copy_template(a, out, TILE=TILE)
+            return out
+
+        program = entry.lower(TILE=32)
+        assert "entry" in [func.name for func in program.functions.values()]
 
     def test_torch_fp4_x2_shape_becomes_logical_ir_shape(self):
         torch = pytest.importorskip("torch")

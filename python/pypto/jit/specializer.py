@@ -130,7 +130,11 @@ class SpecializeContext:
         tensor_meta: TensorMeta per tensor param name.
         scalar_values: Concrete value per scalar param name.
         scalar_dtypes: DataType annotation per scalar param name.
+        constexpr_values: Values bound through ``JITFunction.specialize``.
         dep_names: Names of dep functions called from this function.
+        dep_symbols: Generated method name per source-level dependency name.
+        source_func_name: Original source definition name when ``func_name``
+            is a generated specialization symbol.
         py_globals: Every name visible to the originating function — its
             ``__globals__`` merged with its closure free vars, as built by
             :func:`func_name_lookup`. The specializer uses this to resolve
@@ -181,6 +185,9 @@ class SpecializeContext:
     external_aiv_source: str | None = None
     external_dual_aiv_dispatch: bool = False
     external_include_dirs: tuple[str, ...] = ()
+    constexpr_values: dict[str, int | float | bool] = field(default_factory=dict)
+    dep_symbols: dict[Any, str] = field(default_factory=dict)
+    source_func_name: str | None = None
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -457,7 +464,22 @@ def _collect_annotation_dynamic_dims_cached(
         try:
             import typing  # noqa: PLC0415
 
-            resolved_hints = typing.get_type_hints(func)
+            from pypto.language.typing.constexpr import ConstExpr  # noqa: PLC0415
+
+            annotation_ns = dict(getattr(func, "__globals__", {}))
+            freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
+            closure = getattr(func, "__closure__", None) or ()
+            for freevar, cell in zip(freevars, closure, strict=True):
+                annotation_ns[freevar] = cell.cell_contents
+            func_def = _find_func_def(ast.parse(textwrap.dedent(inspect.getsource(func))), func.__name__)
+            if func_def is not None:
+                for constexpr_name in _constexpr_param_names(func_def):
+                    annotation_ns[constexpr_name] = ConstExpr(constexpr_name)
+            resolved_hints = typing.get_type_hints(
+                func,
+                globalns=annotation_ns,
+                localns=annotation_ns,
+            )
         except Exception:  # noqa: BLE001 - best effort; fall back to raw annotations
             resolved_hints = None
 
@@ -548,15 +570,20 @@ class _BodyTransformer(ast.NodeTransformer):
         tensor_meta: dict[str, TensorMeta],
         scalar_values: dict[str, int | float | bool],
         dep_names: set[str],
+        constexpr_values: dict[str, int | float | bool] | None = None,
         param_names: list[str] | None = None,
         initial_used_names: set[str] | None = None,
         py_globals: dict[str, Any] | None = None,
         dep_param_names: dict[str, list[str]] | None = None,
+        dep_symbols: dict[Any, str] | None = None,
+        dep_constexpr_param_names: dict[str, set[str]] | None = None,
     ) -> None:
         super().__init__()
         self._meta = tensor_meta
         self._scalars = scalar_values
+        self._constexprs = constexpr_values or {}
         self._dep_names = dep_names
+        self._dep_symbols = dep_symbols or {name: name for name in dep_names}
         # DynVar name → (anchor_param, anchor_dim_idx). ``visit_Name`` uses
         # this to rewrite runtime references like ``pl.create_tensor([M, ...])``
         # via ``_dyn_dim_expr`` so the annotation-only DynVar doesn't leak past
@@ -572,6 +599,7 @@ class _BodyTransformer(ast.NodeTransformer):
         # ``self.<dep>(a, out=out)`` calls become parser-accepted
         # ``self.<dep>(a, out)``.
         self._dep_param_names = dep_param_names or {}
+        self._dep_constexpr_param_names = dep_constexpr_param_names or {}
         # Module-level globals from the originating function. Used by
         # ``visit_Name`` to inline imported int/float/bool constants
         # (e.g. ``BATCH = 16`` from a config module) at their use sites.
@@ -856,6 +884,8 @@ class _BodyTransformer(ast.NodeTransformer):
                 return ast.Name(id=self._var_renames[node.id], ctx=ast.Load())
             if node.id in self._scalars:
                 return ast.Constant(value=self._scalars[node.id])
+            if node.id in self._constexprs:
+                return ast.Constant(value=self._constexprs[node.id])
             if node.id in self._shape_inlined:
                 return ast.Constant(value=self._shape_inlined[node.id])
             # DynVar runtime references — e.g. pl.create_tensor([M, HIDDEN], ...).
@@ -922,15 +952,19 @@ class _BodyTransformer(ast.NodeTransformer):
         """
         if isinstance(node.func, ast.Name) and node.func.id in self._dep_names:
             dep_name = node.func.id
+            call_site_key = dep_name, node.lineno, node.col_offset
+            dep_symbol = self._dep_symbols.get(call_site_key, self._dep_symbols.get(dep_name, dep_name))
             new_func = ast.Attribute(
                 value=ast.Name(id="self", ctx=ast.Load()),
-                attr=dep_name,
+                attr=dep_symbol,
                 ctx=ast.Load(),
             )
-            param_order = self._dep_param_names.get(dep_name)
-            if param_order is not None and node.keywords:
+            param_order = self._dep_param_names.get(dep_symbol)
+            constexpr_params = self._dep_constexpr_param_names.get(dep_symbol, set())
+            runtime_keywords = [kw for kw in node.keywords if kw.arg not in constexpr_params]
+            if param_order is not None and runtime_keywords:
                 pos_args = list(node.args)
-                kw_by_name = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
+                kw_by_name = {kw.arg: kw.value for kw in runtime_keywords if kw.arg is not None}
                 # Append keyword-bound args in dep's parameter order, skipping
                 # params already covered by positional args.
                 for param in param_order[len(pos_args) :]:
@@ -939,10 +973,10 @@ class _BodyTransformer(ast.NodeTransformer):
                 # Any remaining keywords (e.g. **kwargs splats or unknown names)
                 # are kept as-is so we don't silently drop them; the parser
                 # will surface them as a clear error.
-                remaining_kw = [kw for kw in node.keywords if kw.arg is None or kw.arg in kw_by_name]
+                remaining_kw = [kw for kw in runtime_keywords if kw.arg is None or kw.arg in kw_by_name]
                 new_node = ast.Call(func=new_func, args=pos_args, keywords=remaining_kw)
             else:
-                new_node = ast.Call(func=new_func, args=node.args, keywords=node.keywords)
+                new_node = ast.Call(func=new_func, args=node.args, keywords=runtime_keywords)
             ast.copy_location(new_node, node)
             return cast("ast.expr", self.generic_visit(new_node))
         return cast("ast.expr", self.generic_visit(node))
@@ -1519,6 +1553,18 @@ def _find_func_def(tree: ast.AST, func_name: str) -> ast.FunctionDef | None:
     return next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == func_name), None)
 
 
+def _constexpr_param_names(func_def: ast.FunctionDef) -> set[str]:
+    """Return keyword-only parameters annotated with ``pl.constexpr``."""
+    result: set[str] = set()
+    for arg in func_def.args.kwonlyargs:
+        annotation = arg.annotation
+        if isinstance(annotation, ast.Name) and annotation.id == "constexpr":
+            result.add(arg.arg)
+        elif isinstance(annotation, ast.Attribute) and annotation.attr == "constexpr":
+            result.add(arg.arg)
+    return result
+
+
 def _original_def_line(ctx: SpecializeContext) -> int | None:
     """Line of the ``def`` inside a context's dedented source, 1-based.
 
@@ -1536,7 +1582,7 @@ def _original_def_line(ctx: SpecializeContext) -> int | None:
         tree = ast.parse(textwrap.dedent(ctx.source))
     except SyntaxError:
         return None
-    node = _find_func_def(tree, ctx.func_name)
+    node = _find_func_def(tree, ctx.source_func_name or ctx.func_name)
     return None if node is None else node.lineno
 
 
@@ -1576,6 +1622,14 @@ class Specializer:
         self._dep_param_names: dict[str, list[str]] = {
             ctx.func_name: list(ctx.param_names) for ctx in contexts
         }
+        self._dep_constexpr_param_names: dict[str, set[str]] = {}
+        for ctx in contexts:
+            tree = ast.parse(textwrap.dedent(ctx.source))
+            source_name = ctx.source_func_name or ctx.func_name
+            func_def = _find_func_def(tree, source_name)
+            self._dep_constexpr_param_names[ctx.func_name] = (
+                _constexpr_param_names(func_def) if func_def is not None else set()
+            )
         # generated-program absolute line → (orig_file, orig_line, orig_col),
         # built by specialize() so diagnostics map back to the user's .py (#1612).
         self._source_map: dict[int, tuple[str, int, int]] = {}
@@ -1715,8 +1769,9 @@ class Specializer:
         # Parse the source to AST
         src = textwrap.dedent(ctx.source)
         tree = ast.parse(src)
-        func_def = _find_func_def(tree, ctx.func_name)
-        assert func_def is not None, f"specialize: no def named {ctx.func_name!r} in its own source"
+        source_func_name = ctx.source_func_name or ctx.func_name
+        func_def = _find_func_def(tree, source_func_name)
+        assert func_def is not None, f"specialize: no def named {source_func_name!r} in its own source"
 
         # Classify parameters
         out_params, inout_params, tensor_params, scalar_dtype_strs, distributed_params = _classify_params(
@@ -1743,7 +1798,7 @@ class Specializer:
             )
 
         # Collect all param names (excluding self)
-        all_param_names = [arg.arg for arg in func_def.args.args if arg.arg != "self"]
+        all_param_names = list(ctx.param_names)
 
         # Build decorator
         decorator = self._build_decorator(ctx)
@@ -1808,10 +1863,13 @@ class Specializer:
             tensor_meta=ctx.tensor_meta,
             scalar_values=ctx.scalar_values,
             dep_names=dep_names,
+            dep_symbols=ctx.dep_symbols,
+            constexpr_values=ctx.constexpr_values,
             param_names=all_param_names,
             initial_used_names=all_defined,
             py_globals=ctx.py_globals,
             dep_param_names=self._dep_param_names,
+            dep_constexpr_param_names=self._dep_constexpr_param_names,
         )
         new_body = [transformer.visit(stmt) for stmt in func_def.body]
         # Accumulate alias→original renames for error message rewriting.
@@ -2088,6 +2146,9 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     external_aiv_source: str | None = None,
     external_dual_aiv_dispatch: bool = False,
     external_include_dirs: tuple[str, ...] = (),
+    constexpr_values: dict[str, int | float | bool] | None = None,
+    dep_symbols: dict[Any, str] | None = None,
+    source_func_name: str | None = None,
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -2099,7 +2160,10 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         tensor_meta: TensorMeta per tensor param name.
         scalar_values: Concrete scalar values from the call site.
         scalar_dtypes: DataType per scalar param name.
+        constexpr_values: Values bound through ``JITFunction.specialize``.
         dep_names: Names of @pl.jit.incore functions called from this function.
+        dep_symbols: Generated method name per source-level dependency name.
+        source_func_name: Original source definition name when ``func_name`` is generated.
         auto_scope: Whether the compiler auto-inserts AUTO runtime scopes.
             Forwarded to the generated ``@pl.function`` decorator; the
             Orchestration entry, HOST orchestrator, and inline sub-functions
@@ -2130,7 +2194,9 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     orig_file = src_file if (src_file and not src_file.startswith("<")) else None
     orig_col_offset = (len(raw_lines[0]) - len(raw_lines[0].lstrip())) if raw_lines else 0
 
-    param_names = [p for p in inspect.signature(func).parameters if p != "self"]
+    func_def = _find_func_def(ast.parse(source), func.__name__)
+    constexpr_params = _constexpr_param_names(func_def) if func_def is not None else set()
+    param_names = [p for p in inspect.signature(func).parameters if p != "self" and p not in constexpr_params]
 
     return SpecializeContext(
         func_name=func_name,
@@ -2141,6 +2207,9 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         tensor_meta=tensor_meta,
         scalar_values=scalar_values,
         scalar_dtypes=scalar_dtypes,
+        constexpr_values=constexpr_values or {},
+        dep_symbols=dep_symbols or {},
+        source_func_name=source_func_name,
         dep_names=dep_names,
         auto_scope=auto_scope,
         # Closure-aware: a factory-defined kernel captures its constants as free

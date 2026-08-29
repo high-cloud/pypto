@@ -197,6 +197,44 @@ deliberate exception: a plain `@pl.jit` entry does **not** discover other `@pl.j
 entries — only `.host` reaches across the chip boundary, which keeps two unrelated
 top-level kernels from silently folding into one program.
 
+### Compile-time template values
+
+Use `pl.constexpr` for model dimensions, numerical constants, and schedule choices that
+must become literals in the generated kernel without becoming runtime parameters.
+The annotation is represented internally by the public `pl.ConstExpr` marker type.
+
+```python
+@pl.jit.inline
+def rms_norm(
+    x: pl.Tensor,
+    out: pl.Tensor,
+    *,
+    HIDDEN: pl.constexpr,
+    TILE: pl.constexpr,
+):
+    for block in pl.range(HIDDEN // TILE):
+        ...
+    return out
+
+@pl.jit
+def model(x: pl.Tensor[[128, 4096], pl.BF16], out: pl.Tensor[[128, 4096], pl.BF16]):
+    return rms_norm(x, out, HIDDEN=4096, TILE=128)
+```
+
+Constexpr parameters must be keyword-only. Every call site must bind all of them to
+compile-time-evaluable `int`, `float`, or `bool` values. The JIT folds those values into
+the function body and compilation-cache key and removes them from the runtime ABI; use
+`pl.Scalar` for values supplied on each dispatch.
+
+The same program may call the source sub-function repeatedly with different constexpr
+bindings. Dependency discovery creates a separate internal specialization for each set
+of values; users do not create aliases or generated function names. The older explicit
+`kernel.specialize(...)` form remains available for compatibility.
+
+Top-level entries use the same syntax: `kernel.compile(TILE=128)`,
+`kernel.lower(TILE=128)`, and eager `kernel(..., TILE=128)` bind and cache the requested
+specialization automatically.
+
 ### Compiling
 
 ```python

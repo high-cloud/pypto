@@ -19,6 +19,7 @@ This module provides type annotation and runtime wrapper classes for PyPTO's lan
 from typing import TypeAlias
 
 from pypto.language.typing.array import Array
+from pypto.language.typing.constexpr import ConstExpr, constexpr
 from pypto.language.typing.direction import InOut, Out
 from pypto.language.typing.dynamic import DynVar, dynamic
 from pypto.language.typing.memref import MemRef
@@ -45,6 +46,7 @@ __all__ = [
     "AsyncEvent",
     "AsyncSession",
     "BoolLike",
+    "ConstExpr",
     "DynVar",
     "InOut",
     "IntLike",
@@ -59,4 +61,5 @@ __all__ = [
     "Tuple",
     "dynamic",
     "predicate_to_expr",
+    "constexpr",
 ]

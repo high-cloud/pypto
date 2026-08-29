@@ -54,6 +54,7 @@ from __future__ import annotations
 import ast
 import copy
 import functools
+import hashlib
 import inspect
 import os
 import re
@@ -390,6 +391,7 @@ def _signature_tensor_meta(
     dynvar_cls: type,
     param_name: str = "",
     func_name: str = "",
+    constexpr_values: dict[str, int | float | bool] | None = None,
 ) -> TensorMeta:
     """Build TensorMeta from a shaped ``pl.Tensor[[...], dtype]`` annotation.
 
@@ -398,10 +400,29 @@ def _signature_tensor_meta(
     remains extent-independent. ``dynvar_cls`` is the lazily-imported ``DynVar``
     type. ``param_name`` / ``func_name`` only feed diagnostics.
     """
+    from pypto.language.typing.constexpr import ConstExpr  # noqa: PLC0415
+
     shape = annotation.shape
-    extents = [
-        1 if (i in dyn_for_param or isinstance(dim, dynvar_cls)) else int(dim) for i, dim in enumerate(shape)
-    ]
+    constexpr_values = constexpr_values or {}
+    extents = []
+    for i, dim in enumerate(shape):
+        if i in dyn_for_param or isinstance(dim, dynvar_cls):
+            extents.append(1)
+        elif isinstance(dim, ConstExpr):
+            if dim.name not in constexpr_values:
+                raise TypeError(
+                    f"@pl.jit function '{func_name}': constexpr '{dim.name}' is unbound; "
+                    f"call {func_name}.specialize({dim.name}=value) first"
+                )
+            value = constexpr_values[dim.name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"@pl.jit function '{func_name}': tensor dimension constexpr "
+                    f"'{dim.name}' must be an int, got {type(value).__name__}"
+                )
+            extents.append(value)
+        else:
+            extents.append(int(dim))
     # Record annotation-only DynVars not already bound via bind_dynamic.
     dyn_dims = dict(dyn_for_param)
     for i, dim in enumerate(shape):
@@ -505,6 +526,59 @@ def _collect_all_called_names(func_def: ast.FunctionDef) -> list[str]:
     return names
 
 
+def _is_constexpr_annotation(annotation: ast.expr | Any) -> bool:
+    """Return whether an annotation declares a compile-time parameter."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id == "constexpr"
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr == "constexpr"
+    if isinstance(annotation, str):
+        return annotation.rsplit(".", 1)[-1] == "constexpr"
+    from pypto.language.typing.constexpr import constexpr  # noqa: PLC0415
+
+    return annotation is constexpr
+
+
+@functools.lru_cache(maxsize=512)
+def _constexpr_parameter_names(func: Any) -> tuple[str, ...]:
+    """Return parameters annotated with ``pl.constexpr`` in declaration order."""
+    func_def = _get_func_def(func)
+    positional = [*func_def.args.posonlyargs, *func_def.args.args]
+    constexpr_positional = [arg.arg for arg in positional if _is_constexpr_annotation(arg.annotation)]
+    if constexpr_positional:
+        names = ", ".join(constexpr_positional)
+        raise TypeError(
+            f"@pl.jit function '{func.__name__}': constexpr parameter(s) {names} must be "
+            "keyword-only; place them after '*' in the function signature"
+        )
+    return tuple(arg.arg for arg in func_def.args.kwonlyargs if _is_constexpr_annotation(arg.annotation))
+
+
+def _eval_constexpr_call_value(
+    func: Any,
+    node: ast.expr,
+    constexpr_values: dict[str, int | float | bool] | None = None,
+) -> int | float | bool:
+    """Evaluate one constexpr call argument in the caller's Python namespace."""
+    namespace = _func_name_lookup(func)
+    namespace.update(constexpr_values or {})
+    try:
+        expression = compile(ast.Expression(node), "<pypto-constexpr>", "eval")
+        value = eval(expression, {**namespace, "__builtins__": {}})  # noqa: S307
+    except Exception as exc:
+        expression = ast.unparse(node)
+        raise TypeError(
+            f"@pl.jit function '{func.__name__}': constexpr argument {expression!r} "
+            "must be evaluable at compile time"
+        ) from exc
+    if not isinstance(value, (int, float, bool)) or isinstance(value, type):
+        raise TypeError(
+            f"@pl.jit function '{func.__name__}': constexpr argument must evaluate to an "
+            f"int, float, or bool, got {type(value).__name__}"
+        )
+    return value
+
+
 def _collect_bind_dynamic_bindings(
     func_def: ast.FunctionDef,
     param_names: set[str],
@@ -596,9 +670,9 @@ def _compute_per_func_dyndim_maps(
     entry_func: Any,
     entry_param_names: list[str],
     deps: list[Any],
-    callers_by_dep_id: dict[int, list[Any]],
-    call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
-) -> dict[int, dict[str, dict[int, DynDim]]]:
+    callers_by_dep_id: dict[Any, list[Any]],
+    call_args_cache: dict[tuple[int, Any], list[tuple[str | None, str | _SlicedArg | None]] | None],
+) -> dict[Any, dict[str, dict[int, DynDim]]]:
     """Per JIT function in the dep graph, return ``param → dim_idx → DynDim``.
 
     Each function's map starts from its own declarations
@@ -612,25 +686,26 @@ def _compute_per_func_dyndim_maps(
     The dep's own declarations take precedence at the caller — caller
     bindings only fill dims the caller didn't already specify.
     """
-    out: dict[int, dict[str, dict[int, DynDim]]] = {
+    out: dict[Any, dict[str, dict[int, DynDim]]] = {
         id(entry_func): {
             p: dict(dims)
             for p, dims in _build_dyndim_map_for_func(entry_func, tuple(entry_param_names)).items()
         }
     }
     for dep in deps:
-        out[id(dep._func)] = {
+        out[_dep_graph_key(dep)] = {
             p: dict(dims)
             for p, dims in _build_dyndim_map_for_func(dep._func, tuple(dep._param_names())).items()
         }
 
     # Leaf-first cascade: a dep's dynamic dim flows up to every recorded caller's arg.
     for dep in deps:
-        dep_map = out[id(dep._func)]
+        dep_key = _dep_graph_key(dep)
+        dep_map = out[dep_key]
         if not dep_map:
             continue
-        for caller_func in callers_by_dep_id.get(id(dep._func), ()):
-            call_args = call_args_cache.get((id(caller_func), dep.__name__))
+        for caller_func in callers_by_dep_id.get(dep_key, ()):
+            call_args = call_args_cache.get((id(caller_func), dep_key))
             if call_args is None:
                 continue
             param_mapping = _build_param_mapping(dep._param_names(), call_args)
@@ -682,8 +757,50 @@ def _build_dynvar_anchor_index(
     return anchors
 
 
+def _func_name_lookup(func: Any) -> dict[str, Any]:
+    """Return ``func.__globals__`` merged with closure free-var bindings.
+
+    A function defined inside a test method (or any other enclosing scope)
+    captures module-level helpers (``HIDDEN``, ``ROWS``, ...) as closure free
+    vars, not as globals — both namespaces have to be inspected for static
+    shape-element resolution to find them. Closure bindings override globals,
+    matching Python's own name-resolution order at the function's call site.
+    """
+    out = func_name_lookup(func)
+    from pypto.language.typing.constexpr import ConstExpr  # noqa: PLC0415
+
+    for name in _constexpr_parameter_names(func):
+        out.setdefault(name, ConstExpr(name))
+    return out
+
+
+def _constexpr_declarations(func: Any) -> dict[str, Any]:
+    """Return source-level names that refer to ``pl.constexpr`` declarations."""
+    from pypto.language.typing.constexpr import ConstExpr  # noqa: PLC0415
+
+    used_names = {node.id for node in ast.walk(_get_func_def(func)) if isinstance(node, ast.Name)}
+    declarations = {
+        name: value
+        for name, value in _func_name_lookup(func).items()
+        if name in used_names and isinstance(value, ConstExpr)
+    }
+    for name in _constexpr_parameter_names(func):
+        declarations[name] = ConstExpr(name)
+    # Annotation evaluation does not create a closure cell for a name used only
+    # in the annotation. Recover those declarations from the resulting Tensor
+    # annotation object so local template factories work without module globals.
+    for param in inspect.signature(func).parameters.values():
+        shape = getattr(param.annotation, "shape", None)
+        for dim in shape or ():
+            if isinstance(dim, ConstExpr):
+                declarations.setdefault(dim.name, dim)
+    return declarations
+
+
 def _scan_dep_io(
-    func: Any, caller_func_type: str = "orchestration"
+    func: Any,
+    caller_func_type: str = "orchestration",
+    caller_constexpr_values: dict[str, int | float | bool] | None = None,
 ) -> dict[str, tuple[list[str], list[str]]]:
     """Return ``dep_name → (param_names, output_param_names)`` for every @pl.jit
     dep called from ``func``'s body.
@@ -701,7 +818,7 @@ def _scan_dep_io(
     orchestrator also admits ``orchestration`` deps (its chip orchestrators).
     """
     out: dict[str, tuple[list[str], list[str]]] = {}
-    for dep in _discover_deps(func, caller_func_type):
+    for dep in _discover_deps(func, caller_func_type, caller_constexpr_values):
         try:
             out_params, inout_params, _, _, _ = _classify_params(_get_func_def(dep._func))
         except OSError:
@@ -709,7 +826,7 @@ def _scan_dep_io(
         param_names = dep._param_names()
         output_set = set(out_params) | set(inout_params)
         output_params = [p for p in param_names if p in output_set]
-        out[dep.__name__] = (param_names, output_params)
+        out[_dep_call_name(dep)] = (param_names, output_params)
     return out
 
 
@@ -976,6 +1093,7 @@ def _extract_local_tensor_metas(
     seed_scalars: dict[str, int | float | bool] | None = None,
     caller_func_type: str = "orchestration",
     stop_at_dep: str | None = None,
+    caller_constexpr_values: dict[str, int | float | bool] | None = None,
 ) -> dict[str, TensorMeta]:
     """Infer ``TensorMeta`` for the local tensor variables in ``func``'s body.
 
@@ -1207,7 +1325,7 @@ def _extract_local_tensor_metas(
             dims.append(v if v is not None else parent_dim)
         return TensorMeta(shape=tuple(dims), dtype=src_meta.dtype, layout=src_meta.layout)
 
-    dep_io = _scan_dep_io(func, caller_func_type)
+    dep_io = _scan_dep_io(func, caller_func_type, caller_constexpr_values)
 
     # Dispatch table: pl.<attr>(...) → meta extraction function.
     # Replaces sequential if-chains, reducing branch and statement counts.
@@ -1249,7 +1367,7 @@ class _Specialization(NamedTuple):
     tensor_meta: dict[str, TensorMeta]
     scalar_values: dict[str, int | float | bool]
     scalar_dtypes: dict[str, DataType]
-    per_func_dyn: dict[int, dict[str, dict[int, DynDim]]]
+    per_func_dyn: dict[Any, dict[str, dict[int, DynDim]]]
 
 
 def _arg_ref(arg: ast.expr) -> str | _SlicedArg | None:
@@ -1274,7 +1392,7 @@ def _arg_ref(arg: ast.expr) -> str | _SlicedArg | None:
 
 
 def _extract_call_args_for_dep(
-    entry_func: Any, dep_name: str
+    entry_func: Any, dep_name: str, call_site: tuple[int, int] | None = None
 ) -> list[tuple[str | None, str | _SlicedArg | None]] | None:
     """Find the arguments passed to ``dep_name`` in ``entry_func``'s body.
 
@@ -1297,6 +1415,8 @@ def _extract_call_args_for_dep(
         for node in ast.walk(func_def)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_name
     ]
+    if call_site is not None:
+        calls = [call for call in calls if (call.lineno, call.col_offset) == call_site]
     if not calls:
         return None
     node = min(calls, key=lambda call: (call.lineno, call.col_offset))
@@ -1342,6 +1462,7 @@ def _resolve_dep_call_metadata(
     caller_scalar_dtypes: dict[str, DataType],
     dep_dyn_map: dict[str, dict[int, DynDim]],
     caller_func_type: str = "orchestration",
+    caller_constexpr_values: dict[str, int | float | bool] | None = None,
 ) -> tuple[
     dict[str, TensorMeta],
     dict[str, int | float | bool],
@@ -1363,13 +1484,19 @@ def _resolve_dep_call_metadata(
     when walking ``v = chip_orch(...)`` return-capture assignments.
     """
     dep_param_names = dep._param_names()
-    call_args = _extract_call_args_for_dep(caller_func, dep.__name__)
+    call_name = _dep_call_name(dep)
+    call_args = _extract_call_args_for_dep(
+        caller_func,
+        call_name,
+        getattr(dep, "_call_site", None),
+    )
     intermediate_metas = _extract_local_tensor_metas(
         caller_func,
         seed_meta=caller_tensor_meta,
         seed_scalars=caller_scalar_values,
         caller_func_type=caller_func_type,
-        stop_at_dep=dep.__name__ if call_args is not None else None,
+        stop_at_dep=call_name if call_args is not None else None,
+        caller_constexpr_values=caller_constexpr_values,
     )
     # The extractor starts from caller_tensor_meta, then applies source-ordered
     # rebindings. Its result is therefore the authoritative state at the call.
@@ -1631,6 +1758,9 @@ class JITFunction:
         _source_hash: Lazily-computed hash of func source + all dep sources.
     """
 
+    _call_name: str
+    _call_site: tuple[int, int]
+
     def __init__(
         self,
         func: Any,
@@ -1642,6 +1772,7 @@ class JITFunction:
         external_aiv_source: str | None = None,
         external_dual_aiv_dispatch: bool = False,
         external_include_dirs: tuple[str, ...] = (),
+        constexpr_values: dict[str, int | float | bool] | None = None,
     ) -> None:
         self._func = func
         self._func_type = func_type or "orchestration"
@@ -1654,16 +1785,21 @@ class JITFunction:
         self._external_aiv_source = external_aiv_source
         self._external_dual_aiv_dispatch = external_dual_aiv_dispatch
         self._external_include_dirs = external_include_dirs
+        self._constexpr_values = dict(constexpr_values or {})
         self._dep_graph: (
             tuple[
                 list[JITFunction],
-                dict[int, list[Any]],
+                dict[Any, list[Any]],
                 dict[int, list[str]],
                 dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
             ]
             | None
         ) = None
+        self._dep_symbols_by_func_id: dict[int, dict[Any, str]] = {}
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
+        self._call_constexpr_specializations: dict[
+            tuple[tuple[str, int | float | bool], ...], JITFunction
+        ] = {}
         self._source_hash: str | None = None
         self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
@@ -1671,6 +1807,85 @@ class JITFunction:
         self.__name__ = func.__name__
         self.__doc__ = func.__doc__
         self.__module__ = func.__module__
+
+    def specialize(self, **constexpr_values: int | float | bool) -> JITFunction:
+        """Bind all ``pl.constexpr`` values and return an independent JIT template instance."""
+        declarations = _constexpr_declarations(self._func)
+        expected = {declaration.name for declaration in declarations.values()}
+        supplied = set(constexpr_values)
+        missing = sorted(expected - supplied)
+        unknown = sorted(supplied - expected)
+        if missing or unknown:
+            details = []
+            if missing:
+                details.append(f"missing {missing}")
+            if unknown:
+                details.append(f"unknown {unknown}")
+            raise TypeError(f"{self.__name__}.specialize(): " + ", ".join(details))
+        for name, value in constexpr_values.items():
+            if not isinstance(value, (int, float, bool)) or isinstance(value, type):
+                raise TypeError(
+                    f"{self.__name__}.specialize(): constexpr '{name}' must be an "
+                    f"int, float, or bool, got {type(value).__name__}"
+                )
+        return JITFunction(
+            self._func,
+            func_type=self._func_type,
+            level=self._level,
+            auto_scope=self._auto_scope,
+            external_core_type=self._external_core_type,
+            external_aic_source=self._external_aic_source,
+            external_aiv_source=self._external_aiv_source,
+            external_dual_aiv_dispatch=self._external_dual_aiv_dispatch,
+            external_include_dirs=self._external_include_dirs,
+            constexpr_values=constexpr_values,
+        )
+
+    def _body_constexpr_values(self) -> dict[str, int | float | bool]:
+        """Map Python source names to their bound compile-time values."""
+        return {
+            source_name: self._constexpr_values[declaration.name]
+            for source_name, declaration in _constexpr_declarations(self._func).items()
+            if declaration.name in self._constexpr_values
+        }
+
+    def _cache_constexpr_values(self) -> dict[str, int | float | bool]:
+        """Return entry and dependency bindings under stable qualified names."""
+        values = {f"{self.__name__}.{name}": value for name, value in self._constexpr_values.items()}
+        for dep in self._get_deps():
+            values.update({f"{dep.__name__}.{name}": value for name, value in dep._constexpr_values.items()})
+        return values
+
+    def _bind_call_constexprs(
+        self,
+        kwargs: dict[str, Any],
+    ) -> tuple[JITFunction, dict[str, Any]]:
+        """Bind signature-declared constexpr kwargs before entry specialization."""
+        param_names = set(_constexpr_parameter_names(self._func))
+        if not param_names:
+            return self, kwargs
+        supplied = {name: kwargs[name] for name in param_names if name in kwargs}
+        missing = sorted(param_names - supplied.keys() - self._constexpr_values.keys())
+        if missing:
+            values = ", ".join(f"{name}=value" for name in missing)
+            raise TypeError(
+                f"@pl.jit function '{self.__name__}' has unbound constexpr values; "
+                f"pass them by keyword, e.g. {self.__name__}(..., {values})"
+            )
+        bindings = {**self._constexpr_values, **supplied}
+        for name, value in bindings.items():
+            if not isinstance(value, (int, float, bool)) or isinstance(value, type):
+                raise TypeError(
+                    f"@pl.jit function '{self.__name__}': constexpr '{name}' must be an "
+                    f"int, float, or bool, got {type(value).__name__}"
+                )
+        runtime_kwargs = {name: value for name, value in kwargs.items() if name not in param_names}
+        if bindings == self._constexpr_values:
+            return self, runtime_kwargs
+        cache_key = tuple(sorted(bindings.items()))
+        if cache_key not in self._call_constexpr_specializations:
+            self._call_constexpr_specializations[cache_key] = self.specialize(**bindings)
+        return self._call_constexpr_specializations[cache_key], runtime_kwargs
 
     @property
     def _diagnostic_filename(self) -> str:
@@ -1763,7 +1978,7 @@ class JITFunction:
         self,
     ) -> tuple[
         list[JITFunction],
-        dict[int, list[Any]],
+        dict[Any, list[Any]],
         dict[int, list[str]],
         dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
     ]:
@@ -1772,63 +1987,68 @@ class JITFunction:
         The graph is computed lazily on first access and cached for the
         lifetime of this ``JITFunction``. Returns:
 
-        - ``deps_topo``: every reachable dep in leaf-first topological order
-          (deduplicated by underlying Python function identity). The entry
-          function is NOT included.
+        - ``deps_topo``: every reachable dep in leaf-first topological order,
+          deduplicated by source function plus constexpr bindings. Distinct
+          specializations of one source function remain distinct nodes. The
+          entry function is NOT included.
         - ``callers_by_dep_id``: for each dep, the list of Python functions
           whose bodies contain a call site to it. Recorded in DFS-discovery
           order; deduplicated within each list. The entry has no caller and
           does not appear as a key.
 
-          Tensor / scalar metadata for a shared dep is still resolved
-          through the first-recorded caller — call sites in other branches
-          must agree on shapes/dtypes (otherwise one specialization would
-          have to differ from another, which the one-context-per-function
-          design doesn't support).
+          Tensor / scalar metadata for a shared specialization is still
+          resolved through the first-recorded caller — call sites in other
+          branches using that same specialization must agree on shapes/dtypes.
         - ``callees_by_func_id``: for each function (entry + every reached
           dep), the names of JIT deps it directly calls. Used to set each
           context's ``dep_names`` so the body transformer rewrites nested
           dep calls into the ``self.<dep>(...)`` form required by
           multi-function ``@pl.program``.
-        - ``call_args_cache``: ``(id(caller_func), dep_name)`` → unified
+        - ``call_args_cache``: ``(id(caller_func), dep_graph_key)`` → unified
           call-site arg list (see ``_extract_call_args_for_dep``) or
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
         """
         if self._dep_graph is None:
             deps_topo: list[JITFunction] = []
-            seen: set[int] = set()
-            callers_by_dep_id: dict[int, list[Any]] = {}
+            seen: set[Any] = set()
+            callers_by_dep_id: dict[Any, list[Any]] = {}
             callees_by_func_id: dict[int, list[str]] = {}
             call_args_cache: dict[
-                tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None
+                tuple[int, Any], list[tuple[str | None, str | _SlicedArg | None]] | None
             ] = {}
 
-            def visit(func: Any, caller_func_type: str) -> None:
-                direct = _discover_deps(func, caller_func_type)
-                callees_by_func_id[id(func)] = [d.__name__ for d in direct]
+            def visit(
+                func: Any,
+                caller_func_type: str,
+                constexpr_values: dict[str, int | float | bool],
+            ) -> None:
+                direct = _discover_deps(func, caller_func_type, constexpr_values)
+                callees_by_func_id[id(func)] = list(dict.fromkeys(_dep_call_name(d) for d in direct))
+                self._dep_symbols_by_func_id[id(func)] = {_dep_call_site_key(d): d.__name__ for d in direct}
                 for dep in direct:
-                    # Key everything off ``id(dep._func)`` (the underlying
-                    # Python function) — same key the downstream helpers
-                    # use, and stable across multiple wrapper objects for
-                    # the same source function.
-                    callers = callers_by_dep_id.setdefault(id(dep._func), [])
+                    dep_key = _dep_graph_key(dep)
+                    callers = callers_by_dep_id.setdefault(dep_key, [])
                     if func not in callers:
                         callers.append(func)
                     # Memoise per-(caller, dep) call-site args once.
-                    cache_key = (id(func), dep.__name__)
+                    cache_key = (id(func), dep_key)
                     if cache_key not in call_args_cache:
-                        call_args_cache[cache_key] = _extract_call_args_for_dep(func, dep.__name__)
-                    if id(dep._func) in seen:
+                        call_args_cache[cache_key] = _extract_call_args_for_dep(
+                            func,
+                            _dep_call_name(dep),
+                            getattr(dep, "_call_site", None),
+                        )
+                    if dep_key in seen:
                         continue
                     # Mark before recursing — this also serves as a cycle
                     # guard (a self-recursive JIT function is unsupported
                     # but won't loop forever here).
-                    seen.add(id(dep._func))
-                    visit(dep._func, dep._func_type)
+                    seen.add(dep_key)
+                    visit(dep._func, dep._func_type, dep._body_constexpr_values())
                     deps_topo.append(dep)
 
-            visit(self._func, self._func_type)
+            visit(self._func, self._func_type, self._body_constexpr_values())
             self._dep_graph = (
                 deps_topo,
                 callers_by_dep_id,
@@ -1889,7 +2109,10 @@ class JITFunction:
     # ------------------------------------------------------------------
 
     def _param_names(self) -> list[str]:
-        return [p for p in inspect.signature(self._func).parameters if p != "self"]
+        constexpr_params = set(_constexpr_parameter_names(self._func))
+        return [
+            p for p in inspect.signature(self._func).parameters if p != "self" and p not in constexpr_params
+        ]
 
     def _bind_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -1899,7 +2122,7 @@ class JITFunction:
         dict[str, TensorMeta],
         dict[str, int | float | bool],
         dict[str, DataType],
-        dict[int, dict[str, dict[int, DynDim]]],
+        dict[Any, dict[str, dict[int, DynDim]]],
     ]:
         """Bind *args/**kwargs to param names and classify into tensor/scalar metadata.
 
@@ -1972,7 +2195,7 @@ class JITFunction:
         dict[str, TensorMeta],
         dict[str, int | float | bool],
         dict[str, DataType],
-        dict[int, dict[str, dict[int, DynDim]]],
+        dict[Any, dict[str, dict[int, DynDim]]],
     ]:
         """Derive the same metadata as ``_bind_args``, but from the kernel's
         own parameter annotations — no tensor arguments required.
@@ -2054,6 +2277,7 @@ class JITFunction:
                     DynVar,
                     param_name=name,
                     func_name=self.__name__,
+                    constexpr_values=self._constexpr_values,
                 )
                 continue
             if isinstance(annotation, type) and issubclass(annotation, Tensor):
@@ -2110,6 +2334,18 @@ class JITFunction:
         Returns:
             The specialization metadata and the consumed ``RunConfig``.
         """
+        for jit_func in [self, *self._get_deps()]:
+            declarations = _constexpr_declarations(jit_func._func)
+            missing_constexprs = sorted(
+                {declaration.name for declaration in declarations.values()}
+                - jit_func._constexpr_values.keys()
+            )
+            if missing_constexprs:
+                bindings = ", ".join(f"{name}=value" for name in missing_constexprs)
+                raise TypeError(
+                    f"@pl.jit function '{jit_func.__name__}' has unbound constexpr values; "
+                    f"call {jit_func.__name__}.specialize({bindings}) first"
+                )
         # Extract RunConfig without mutating *kwargs* — although the caller's
         # ``**kwargs`` dict is normally owned by Python at this scope, building
         # a fresh dict is the same cost and removes the ambiguity for readers
@@ -2207,6 +2443,7 @@ class JITFunction:
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },
             scalar_values=specialization.scalar_values,
+            constexpr_values=self._cache_constexpr_values(),
             platform=platform,
             strategy=strategy,
             distributed_config=distributed_config,
@@ -2271,6 +2508,9 @@ class JITFunction:
             attribute — read it from the runtime's ``[STRACE]`` log markers
             (simpler PR #1177).
         """
+        bound_jit, kwargs = self._bind_call_constexprs(kwargs)
+        if bound_jit is not self:
+            return bound_jit(*args, **kwargs)
         compiled, ordered_args, run_config = self._resolve_compiled(args, kwargs)
         if run_config is not None:
             return compiled(*ordered_args, config=run_config)
@@ -2365,6 +2605,9 @@ class JITFunction:
         Returns:
             The cached ``CompiledProgram`` for this specialization.
         """
+        bound_jit, kwargs = self._bind_call_constexprs(kwargs)
+        if bound_jit is not self:
+            return bound_jit.compile(*args, **kwargs)
         compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
         return compiled
 
@@ -2387,6 +2630,10 @@ class JITFunction:
         Returns:
             The specialized ``ir.Program`` after configured passes.
         """
+        bound_jit, kwargs = self._bind_call_constexprs(kwargs)
+        if bound_jit is not self:
+            return bound_jit.lower(*args, **kwargs)
+
         import pypto.language as pl  # noqa: PLC0415
         from pypto.ir.compile import _run_pass_pipeline  # noqa: PLC0415
 
@@ -2427,7 +2674,7 @@ class JITFunction:
         tensor_meta: dict[str, TensorMeta],
         scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
-        per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
+        per_func_dyn: dict[Any, dict[str, dict[int, DynDim]]],
         pl: Any,
         platform: str | None = None,
         **ir_compile_kwargs: Any,
@@ -2470,7 +2717,7 @@ class JITFunction:
         tensor_meta: dict[str, TensorMeta],
         scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
-        per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
+        per_func_dyn: dict[Any, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> Any:
         """Specialize entry + deps and return the parsed pre-pass ``ir.Program``."""
@@ -2488,7 +2735,7 @@ class JITFunction:
         tensor_meta: dict[str, TensorMeta],
         scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
-        per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
+        per_func_dyn: dict[Any, dict[str, dict[int, DynDim]]],
         pl: Any,
     ) -> tuple[Any, dict[str, str]]:
         """Return the parsed pre-pass program and specializer rename map."""
@@ -2511,7 +2758,7 @@ class JITFunction:
         tensor_meta: dict[str, TensorMeta],
         scalar_values: dict[str, int | float | bool],
         scalar_dtypes: dict[str, DataType],
-        per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
+        per_func_dyn: dict[Any, dict[str, dict[int, DynDim]]],
     ) -> list[SpecializeContext]:
         """Build SpecializeContext list for entry + every transitive dep.
 
@@ -2536,14 +2783,14 @@ class JITFunction:
         # Map each Python function id → its JIT ``_func_type`` so meta
         # resolution downstream can gate dep discovery on the caller's type
         # (a host orchestrator additionally admits ``orchestration`` deps).
-        func_type_by_id: dict[int, str] = {id(self._func): self._func_type}
+        func_type_by_id: dict[Any, str] = {id(self._func): self._func_type}
         for d in deps_topo:
-            func_type_by_id[id(d._func)] = d._func_type
+            func_type_by_id[_dep_graph_key(d)] = d._func_type
 
         # Walk caller-first to resolve each dep's metadata from its actual
         # caller's already-resolved metadata.
         resolved: dict[
-            int,
+            Any,
             tuple[
                 dict[str, TensorMeta],
                 dict[str, int | float | bool],
@@ -2561,19 +2808,26 @@ class JITFunction:
             # diamond ``entry -> {A, B} -> shared`` only one specialization
             # of ``shared`` is emitted, so the call sites in other branches
             # must agree on shapes/dtypes anyway.
-            caller_func = callers_by_id[id(dep._func)][0]
+            dep_key = _dep_graph_key(dep)
+            caller_func = callers_by_id[dep_key][0]
             c_meta, c_sv, c_sd = resolved[id(caller_func)]
             caller_ftype = func_type_by_id.get(id(caller_func), "orchestration")
+            if caller_func is self._func:
+                caller_constexpr_values = self._body_constexpr_values()
+            else:
+                caller_dep = next(d for d in deps_topo if d._func is caller_func)
+                caller_constexpr_values = caller_dep._body_constexpr_values()
             dep_meta, dep_sv, dep_sd = _resolve_dep_call_metadata(
                 dep,
                 caller_func,
                 c_meta,
                 c_sv,
                 c_sd,
-                per_func_dyn.get(id(dep._func), empty_dyn),
+                per_func_dyn.get(dep_key, empty_dyn),
                 caller_func_type=caller_ftype,
+                caller_constexpr_values=caller_constexpr_values,
             )
-            resolved[id(dep._func)] = (dep_meta, dep_sv, dep_sd)
+            resolved[dep_key] = (dep_meta, dep_sv, dep_sd)
             dep_contexts.append(
                 build_specialize_context(
                     func=dep._func,
@@ -2584,6 +2838,9 @@ class JITFunction:
                     scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
                     dep_names=callees_by_id[id(dep._func)],
+                    dep_symbols=self._dep_symbols_by_func_id[id(dep._func)],
+                    constexpr_values=dep._body_constexpr_values(),
+                    source_func_name=dep._func.__name__,
                     auto_scope=dep._auto_scope,
                     external_core_type=dep._external_core_type,
                     external_aic_source=dep._external_aic_source,
@@ -2603,6 +2860,8 @@ class JITFunction:
             scalar_values=scalar_values,
             scalar_dtypes=scalar_dtypes,
             dep_names=callees_by_id[id(self._func)],
+            dep_symbols=self._dep_symbols_by_func_id[id(self._func)],
+            constexpr_values=self._body_constexpr_values(),
             auto_scope=self._auto_scope,
         )
         return dep_contexts + [entry_ctx]
@@ -2616,7 +2875,40 @@ class JITFunction:
 # ---------------------------------------------------------------------------
 
 
-def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
+def _dep_call_name(dep: JITFunction) -> str:
+    """Return the Python name used at the caller's call site."""
+    return getattr(dep, "_call_name", dep.__name__)
+
+
+def _dep_call_site_key(dep: JITFunction) -> tuple[str, int, int]:
+    """Identity of a dependency call site inside its caller."""
+    line, column = getattr(dep, "_call_site", (0, 0))
+    return _dep_call_name(dep), line, column
+
+
+def _dep_graph_key(dep: JITFunction) -> Any:
+    """Identity of one source-function specialization in the dependency graph."""
+    call_name = _dep_call_name(dep)
+    bindings = tuple(sorted(dep._constexpr_values.items()))
+    if not bindings and call_name == dep._func.__name__:
+        return id(dep._func)
+    return id(dep._func), bindings
+
+
+def _specialized_symbol_name(dep: JITFunction) -> str:
+    """Stable generated method name for a constexpr specialization."""
+    if not dep._constexpr_values:
+        return _dep_call_name(dep)
+    bindings = tuple(sorted(dep._constexpr_values.items()))
+    digest = hashlib.sha256(repr(bindings).encode()).hexdigest()[:8]
+    return f"{dep._func.__name__}__constexpr_{digest}"
+
+
+def _discover_deps(
+    func: Any,
+    caller_func_type: str = "orchestration",
+    caller_constexpr_values: dict[str, int | float | bool] | None = None,
+) -> list[JITFunction]:
     """Discover JIT dep functions called by ``func``.
 
     Scans the function's AST for bare function calls, then resolves each name
@@ -2639,34 +2931,49 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
     """
     func_def = _get_func_def(func)
 
-    called_names = _collect_all_called_names(func_def)
-
-    # Module-level globals
-    func_globals = getattr(func, "__globals__", {})
-
-    # Closure variables (covers deps defined in an enclosing scope)
-    closure_vars: dict[str, Any] = {}
-    co_freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
-    closure = getattr(func, "__closure__", None) or ()
-    for name, cell in zip(co_freevars, closure):
-        try:
-            closure_vars[name] = cell.cell_contents
-        except ValueError:
-            pass
-
-    all_vars = {**func_globals, **closure_vars}
+    all_vars = _func_name_lookup(func)
 
     allowed_dep_types: set[str] = {"incore", "inline", "opaque", "extern"}
     if caller_func_type == "host":
         allowed_dep_types.add("orchestration")
 
     deps: list[JITFunction] = []
-    seen: set[str] = set()
-    for name in called_names:
+    calls = sorted(
+        (
+            node
+            for node in ast.walk(func_def)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    for call in calls:
+        if not isinstance(call.func, ast.Name):
+            continue
+        name = call.func.id
         obj = all_vars.get(name)
-        if isinstance(obj, JITFunction) and obj._func_type in allowed_dep_types and name not in seen:
-            deps.append(obj)
-            seen.add(name)
+        if not isinstance(obj, JITFunction) or obj._func_type not in allowed_dep_types:
+            continue
+        dep = copy.copy(obj)
+        declarations = _constexpr_declarations(dep._func)
+        expected = {declaration.name for declaration in declarations.values()}
+        supplied = {
+            kw.arg: _eval_constexpr_call_value(func, kw.value, caller_constexpr_values)
+            for kw in call.keywords
+            if kw.arg in expected
+        }
+        bindings = {**dep._constexpr_values, **supplied}
+        missing = sorted(expected - bindings.keys())
+        if missing:
+            values = ", ".join(f"{key}=value" for key in missing)
+            raise TypeError(
+                f"@pl.jit dependency '{name}' has unbound constexpr values; "
+                f"pass them at the call site, e.g. {name}(..., {values})"
+            )
+        dep._constexpr_values = bindings
+        dep._call_name = name
+        dep._call_site = (call.lineno, call.col_offset)
+        dep.__name__ = _specialized_symbol_name(dep)
+        deps.append(dep)
     return deps
 
 

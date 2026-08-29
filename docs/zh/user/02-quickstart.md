@@ -184,6 +184,41 @@ add_program   (@pl.jit, Orchestration)  —— 控制面：派发
 发现其他 `@pl.jit` 入口 —— 只有 `.host` 会跨越芯片边界，这样可以避免两个不相关的顶层 kernel
 被静默折叠进同一个 program。
 
+### 编译期模板参数
+
+模型维度、数值常量和调度选项如果需要在生成的 kernel 中变成字面量、又不应成为运行时参数，
+可以使用函数签名中的 `pl.constexpr`。
+该注解在内部由公开的 `pl.ConstExpr` 标记类型表示。
+
+```python
+@pl.jit.inline
+def rms_norm(
+    x: pl.Tensor,
+    out: pl.Tensor,
+    *,
+    HIDDEN: pl.constexpr,
+    TILE: pl.constexpr,
+):
+    for block in pl.range(HIDDEN // TILE):
+        ...
+    return out
+
+@pl.jit
+def model(x: pl.Tensor[[128, 4096], pl.BF16], out: pl.Tensor[[128, 4096], pl.BF16]):
+    return rms_norm(x, out, HIDDEN=4096, TILE=128)
+```
+
+constexpr 参数必须是仅限关键字参数。每个调用点都必须把它们绑定为编译期可求值的 `int`、
+`float` 或 `bool`。JIT 会把这些值折叠进函数体和编译缓存键，并从运行时 ABI 中删除；每次派发
+才提供的值应使用 `pl.Scalar`。
+
+同一个 program 可以用不同 constexpr 参数重复调用同一个源子函数。依赖发现会为每组值建立独立
+的内部 specialization；用户无需创建别名或生成函数名。旧的显式 `kernel.specialize(...)` 写法
+仍作为兼容接口保留。
+
+顶层入口采用相同语法：`kernel.compile(TILE=128)`、`kernel.lower(TILE=128)` 和即时执行的
+`kernel(..., TILE=128)` 都会自动绑定并缓存相应 specialization。
+
 ### 编译
 
 ```python

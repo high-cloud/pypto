@@ -90,6 +90,27 @@ class TestMakeCacheKey:
             runtime=runtime,
         )
 
+    def test_constexpr_values_split_cache_key(self):
+        key_64 = make_cache_key(
+            source_hash="abc",
+            param_names=[],
+            tensor_shapes={},
+            tensor_dtypes={},
+            dynamic_dims=set(),
+            scalar_values={},
+            constexpr_values={"kernel.TILE": 64},
+        )
+        key_32 = make_cache_key(
+            source_hash="abc",
+            param_names=[],
+            tensor_shapes={},
+            tensor_dtypes={},
+            dynamic_dims=set(),
+            scalar_values={},
+            constexpr_values={"kernel.TILE": 32},
+        )
+        assert key_32 != key_64
+
     def test_basic_key_structure(self):
         key = self._make_key(
             param_names=["a"],

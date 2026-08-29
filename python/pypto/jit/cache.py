@@ -81,6 +81,14 @@ class ScalarCacheInfo:
     value: int | float | bool
 
 
+@dataclass(frozen=True)
+class ConstexprCacheInfo:
+    """Per-constexpr component of a cache key."""
+
+    name: str
+    value: int | float | bool
+
+
 # A cache key is a tuple of
 # (source_hash, platform, strategy, tensor_infos, scalar_infos, dist_config, compile_opts).
 # Using a plain tuple keeps it hashable without a custom __hash__.
@@ -149,6 +157,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     dep_layouts: tuple[tuple[str, str, str], ...] = (),
     closure_constants: tuple[tuple[str, str, str], ...] = (),
     runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
+    constexpr_values: dict[str, int | float | bool] | None = None,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -177,6 +186,7 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             Dynamic dims are stored as None in the cache key so different
             concrete values for that dimension produce the same cache entry.
         scalar_values: Concrete value per scalar parameter name.
+        constexpr_values: Values bound through ``JITFunction.specialize``.
         platform: Target platform string (e.g. "a2a3sim"). Included in the key
             because compiled artifacts are platform-specific; a cache entry
             compiled for one platform must not be reused for another.
@@ -259,6 +269,13 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("closure_constants", closure_constants),
         ("runtime", runtime_kind_to_name(runtime)),
     )
+    if constexpr_values:
+        compile_opts += (
+            (
+                "constexpr_values",
+                tuple(ConstexprCacheInfo(name, value) for name, value in sorted(constexpr_values.items())),
+            ),
+        )
     return (
         source_hash,
         platform,
@@ -333,6 +350,7 @@ def l2_store(key: CacheKey, output_dir: str) -> None:
 
 __all__ = [
     "CacheKey",
+    "ConstexprCacheInfo",
     "ScalarCacheInfo",
     "TensorCacheInfo",
     "compute_source_hash",
